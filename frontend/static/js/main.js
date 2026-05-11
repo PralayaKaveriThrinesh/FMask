@@ -105,4 +105,52 @@ document.addEventListener('DOMContentLoaded', () => {
     setInterval(updateClock, 1000);
     setInterval(updateStats, 1000); // 1-second interval as requested
     updateStats(); // Initial call
+    
+    // Tab Navigation Logic
+    const navLinks = document.querySelectorAll('.nav-link');
+    const viewSections = document.querySelectorAll('.view-section');
+
+    navLinks.forEach(link => {
+        link.addEventListener('click', (e) => {
+            e.preventDefault();
+            const targetId = link.getAttribute('data-target');
+            if (!targetId) return;
+
+            // Update active link state
+            navLinks.forEach(nav => nav.classList.remove('active'));
+            link.classList.add('active');
+
+            // Hide all sections, show target section
+            viewSections.forEach(section => {
+                section.style.display = 'none';
+            });
+            const targetSection = document.getElementById(targetId);
+            if (targetSection) {
+                targetSection.style.display = 'block';
+            }
+        });
+    });
+
+    // Settings Toggles Logic
+    const toggleSwitches = document.querySelectorAll('.toggle-switch');
+    toggleSwitches.forEach(toggle => {
+        toggle.addEventListener('click', () => {
+            const isActive = toggle.classList.contains('active');
+            const knob = toggle.querySelector('.toggle-knob');
+            
+            if (isActive) {
+                // Turn off
+                toggle.classList.remove('active');
+                toggle.style.background = 'rgba(255,255,255,0.2)';
+                knob.style.right = 'auto';
+                knob.style.left = '2px';
+            } else {
+                // Turn on
+                toggle.classList.add('active');
+                toggle.style.background = 'var(--success)';
+                knob.style.left = 'auto';
+                knob.style.right = '2px';
+            }
+        });
+    });
 });

@@ -31,10 +31,16 @@ stats = {
     "total_people": 0,
     "with_mask": 0,
     "without_mask": 0,
+    "partial_mask": 0,
     "safety_score": 100,
     "start_time": datetime.datetime.now(),
     "uptime": "00:00:00"
 }
+
+# Thresholds
+MIN_FACE_CONFIDENCE = 0.15
+MIN_FACE_SIZE = 50
+PARTIAL_COVER_THRESHOLD = 0.2
 
 # Load Models
 faceNet = None
@@ -61,7 +67,21 @@ if HAS_ML:
 def calculate_safety_score():
     if stats["total_people"] == 0:
         return 100
-    return int((stats["with_mask"] / stats["total_people"]) * 100)
+    score = (stats["with_mask"] * 100 + stats["partial_mask"] * 50) / stats["total_people"]
+    return int(score)
+
+def calculate_iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+    iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+    return iou
+
+face_history = []
 
 def detect_and_predict_mask(frame):
     (h, w) = frame.shape[:2]
@@ -70,23 +90,22 @@ def detect_and_predict_mask(frame):
 
     # Try Caffe Detector first
     if faceNet is not None:
-        blob = cv2.dnn.blobFromImage(frame, 1.0, (224, 224), (104.0, 177.0, 123.0))
+        blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
         faceNet.setInput(blob)
         detections = faceNet.forward()
         for i in range(detections.shape[2]):
             confidence = detections[0, 0, i, 2]
-            if confidence > 0.5:
+            if confidence > MIN_FACE_CONFIDENCE:
                 box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
                 (startX, startY, endX, endY) = box.astype("int")
-                locs.append((max(0, startX), max(0, startY), min(w - 1, endX), min(h - 1, endY)))
+                
+                startX, startY = max(0, startX), max(0, startY)
+                endX, endY = min(w - 1, endX), min(h - 1, endY)
+                
+                if (endX - startX) >= MIN_FACE_SIZE and (endY - startY) >= MIN_FACE_SIZE:
+                    locs.append((startX, startY, endX, endY))
     
-    # Fallback to Haar Cascade if no faces found with Caffe or Caffe is missing
-    if len(locs) == 0:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        # Higher sensitivity for masked faces (smaller scaleFactor, fewer neighbors)
-        faces = haarNet.detectMultiScale(gray, 1.08, 3, minSize=(50, 50))
-        for (x, y, fw, fh) in faces:
-            locs.append((x, y, x + fw, y + fh))
+    # Removed Haar Cascade fallback to prevent false positives on background textures
 
     # Process faces for mask prediction
     for (startX, startY, endX, endY) in locs:
@@ -97,26 +116,49 @@ def detect_and_predict_mask(frame):
                 face = img_to_array(cv2.cvtColor(face, cv2.COLOR_BGR2RGB))
                 face = preprocess_input(face)
                 pred = maskNet.predict(np.expand_dims(face, axis=0))[0]
-                preds.append(pred)
+                mask_prob, no_mask_prob = pred[0], pred[1]
+                
+                if abs(mask_prob - no_mask_prob) < PARTIAL_COVER_THRESHOLD:
+                    preds.append({'label': "Partial Cover", 'prob': max(mask_prob, no_mask_prob)})
+                elif mask_prob > no_mask_prob:
+                    preds.append({'label': "Mask", 'prob': mask_prob})
+                else:
+                    preds.append({'label': "No Mask", 'prob': no_mask_prob})
             except:
-                preds.append([0.5, 0.5])
+                preds.append({'label': "Partial Cover", 'prob': 0.5})
         else:
-            # --- IMPROVED SIMULATION FOR DEMO ---
-            # We look at the lower half of the detected face area.
-            # If it's mostly "white/light" (like a medical mask), we simulate 'Masked'
+            # --- ENHANCED SIMULATION FOR KERCHIEF AND HAND DETECTION ---
             face_roi = frame[startY:endY, startX:endX]
-            lower_half = face_roi[int(face_roi.shape[0]/2):, :]
-            avg_color = np.mean(lower_half)
-            
-            # If the bottom of the face is very bright (white mask) or significantly different
-            if avg_color > 180: # Light colored mask
-                preds.append([0.95, 0.05]) # High probability of mask
+            if face_roi.shape[0] > 0 and face_roi.shape[1] > 0:
+                lower_half = face_roi[int(face_roi.shape[0]/2):, :]
+                
+                # Analyze texture and edges
+                gray_lower = cv2.cvtColor(lower_half, cv2.COLOR_BGR2GRAY)
+                edges = cv2.Canny(gray_lower, 50, 150)
+                edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1] + 1e-6)
+                
+                avg_color = np.mean(lower_half)
+                std_color = np.std(lower_half)
+                
+                # High edge density = heavily textured cloth (kerchief)
+                # Or high standard deviation = lots of variation (cloth pattern or hand shadow)
+                if edge_density > 0.12 or std_color > 45:
+                    preds.append({'label': "Partial Cover", 'prob': 0.65})
+                # Check for standard medical masks (very smooth, bright)
+                elif avg_color > 160 and std_color < 30:
+                    preds.append({'label': "Mask", 'prob': 0.95})
+                # Check for a hand covering mouth (moderate edges, skin color range)
+                elif edge_density > 0.05 and 80 < avg_color < 160:
+                    preds.append({'label': "Partial Cover", 'prob': 0.55})
+                else:
+                    preds.append({'label': "No Mask", 'prob': 0.92})
             else:
-                preds.append([0.05, 0.95]) # No mask
+                preds.append({'label': "No Mask", 'prob': 0.92})
 
     return (locs, preds)
 
 def generate_frames():
+    global face_history
     cap = cv2.VideoCapture(0)
     
     while True:
@@ -134,26 +176,43 @@ def generate_frames():
         frame = cv2.resize(frame, (600, 450))
         (locs, preds) = detect_and_predict_mask(frame)
 
+        current_faces = []
+        for box, pred in zip(locs, preds):
+            for hist in face_history:
+                if calculate_iou(box, hist['box']) > 0.4:
+                    if hist['label'] != pred['label'] and pred['prob'] < 0.7:
+                         pred['label'] = hist['label']
+                         pred['prob'] = hist['prob']
+                    break
+            current_faces.append({'box': box, 'label': pred['label'], 'prob': pred['prob']})
+        face_history = current_faces
+
         stats["total_people"] = len(locs)
         stats["with_mask"] = 0
+        stats["partial_mask"] = 0
         no_mask_count = 0
 
-        for (box, pred) in zip(locs, preds):
-            (startX, startY, endX, endY) = box
-            (mask, withoutMask) = pred
+        for face in current_faces:
+            (startX, startY, endX, endY) = face['box']
+            label = face['label']
+            prob = face['prob']
 
-            if mask > withoutMask:
-                label = "Masked"
+            if label == "Mask":
+                display_label = f"Mask: {prob*100:.0f}% (Safe)"
                 color = (0, 255, 0)
                 stats["with_mask"] += 1
+            elif label == "Partial Cover":
+                display_label = f"Partial Cover: {prob*100:.0f}% (Moderate)"
+                color = (0, 255, 255)
+                stats["partial_mask"] += 1
             else:
-                label = "No Mask"
+                display_label = f"No Mask: {prob*100:.0f}% (Unsafe)"
                 color = (0, 0, 255)
                 no_mask_count += 1
 
             # Draw bounding box + label
             cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
-            cv2.putText(frame, label, (startX, startY - 10),
+            cv2.putText(frame, display_label, (startX, startY - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
         stats["without_mask"] = no_mask_count
@@ -163,12 +222,14 @@ def generate_frames():
         # --- Dynamic Count-Based Alert Message ---
         if stats["total_people"] == 0:
             alert_msg = None
-        elif no_mask_count == 0:
+        elif no_mask_count == 0 and stats["partial_mask"] == 0:
             alert_msg = None
-        elif no_mask_count == 1:
-            alert_msg = "ALERT: 1 person not wearing mask!"
+        elif no_mask_count > 0:
+            alert_msg = f"ALERT: {no_mask_count} person(s) not wearing mask!"
+        elif stats["partial_mask"] > 0:
+            alert_msg = f"WARNING: {stats['partial_mask']} person(s) wearing mask improperly"
         else:
-            alert_msg = f"ALERT: {no_mask_count} persons not wearing mask!"
+            alert_msg = None
 
         stats["alert_message"] = alert_msg if alert_msg else ""
 
@@ -177,7 +238,8 @@ def generate_frames():
             # Blinking background strip
             current_time = time.time()
             if int(current_time * 2) % 2:
-                cv2.rectangle(frame, (0, 405), (600, 450), (0, 0, 180), -1)
+                alert_bg = (0, 0, 180) if "ALERT" in alert_msg else (0, 180, 180)
+                cv2.rectangle(frame, (0, 405), (600, 450), alert_bg, -1)
             cv2.putText(frame, alert_msg, (10, 440),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
@@ -189,7 +251,7 @@ def generate_frames():
         current_time = time.time()
         safety_score = stats["safety_score"]
         status = "SAFE ZONE" if safety_score >= 90 else "CAUTION" if safety_score >= 70 else "DANGER"
-        status_color = (0, 255, 0) if safety_score >= 90 else (0, 200, 200) if safety_score >= 70 else (0, 0, 255)
+        status_color = (0, 255, 0) if safety_score >= 90 else (0, 255, 255) if safety_score >= 70 else (0, 0, 255)
 
         if status == "DANGER" and int(current_time * 2) % 2:
             status_color = (255, 255, 255)
@@ -197,9 +259,9 @@ def generate_frames():
         cv2.putText(frame, f"STATUS: {status}  ({safety_score}%)", (15, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, status_color, 2)
         cv2.putText(frame,
-                    f"Total: {stats['total_people']}  |  Masked: {stats['with_mask']}  |  No Mask: {no_mask_count}",
+                    f"Total: {stats['total_people']} | Mask: {stats['with_mask']} | Partial: {stats['partial_mask']} | No: {no_mask_count}",
                     (15, 88),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
 
         ret, buffer = cv2.imencode('.jpg', frame)
         yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
@@ -219,3 +281,4 @@ def get_stats():
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
+# Trigger reload for new models
