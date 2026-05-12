@@ -127,29 +127,48 @@ def detect_and_predict_mask(frame):
             except:
                 preds.append({'label': "Partial Cover", 'prob': 0.5})
         else:
-            # --- ENHANCED SIMULATION FOR KERCHIEF AND HAND DETECTION ---
+            # --- ENHANCED SIMULATION FOR BLACK/WHITE MASKS, KERCHIEF AND HAND DETECTION ---
             face_roi = frame[startY:endY, startX:endX]
             if face_roi.shape[0] > 0 and face_roi.shape[1] > 0:
+                # Focus on the lower half of the face where masks/hands/kerchiefs are
                 lower_half = face_roi[int(face_roi.shape[0]/2):, :]
                 
-                # Analyze texture and edges
+                # Analyze color and texture
                 gray_lower = cv2.cvtColor(lower_half, cv2.COLOR_BGR2GRAY)
-                edges = cv2.Canny(gray_lower, 50, 150)
+                edges = cv2.Canny(gray_lower, 30, 100) # Slightly more sensitive
                 edge_density = np.sum(edges > 0) / (edges.shape[0] * edges.shape[1] + 1e-6)
                 
                 avg_color = np.mean(lower_half)
                 std_color = np.std(lower_half)
                 
-                # High edge density = heavily textured cloth (kerchief)
-                # Or high standard deviation = lots of variation (cloth pattern or hand shadow)
-                if edge_density > 0.12 or std_color > 45:
-                    preds.append({'label': "Partial Cover", 'prob': 0.65})
-                # Check for standard medical masks (very smooth, bright)
-                elif avg_color > 160 and std_color < 30:
-                    preds.append({'label': "Mask", 'prob': 0.95})
-                # Check for a hand covering mouth (moderate edges, skin color range)
-                elif edge_density > 0.05 and 80 < avg_color < 160:
-                    preds.append({'label': "Partial Cover", 'prob': 0.55})
+                # Convert to HSV to detect skin tones (hands)
+                hsv_lower = cv2.cvtColor(lower_half, cv2.COLOR_BGR2HSV)
+                avg_hsv = np.mean(hsv_lower, axis=(0,1))
+                # Typical skin tone range in HSV: H: 0-25, S: 20-150
+                is_skin_tone = 0 <= avg_hsv[0] <= 25 and 40 <= avg_hsv[1] <= 150
+
+                # 1. Check for Hand/Skin Tone (Skin color range)
+                # If it's skin tone, it's either NO mask or a hand covering the face
+                if is_skin_tone:
+                    # Hand covering often has more texture/edges (fingers, palm lines)
+                    if edge_density > 0.05 or std_color > 40:
+                        preds.append({'label': "Partial Cover", 'prob': 0.88})
+                    else:
+                        preds.append({'label': "No Mask", 'prob': 0.92})
+                
+                # 2. Check for White/Bright Mask (Low saturation, high brightness)
+                elif avg_hsv[1] < 45 and avg_hsv[2] > 120 and std_color < 65:
+                    preds.append({'label': "Mask", 'prob': 0.96})
+                
+                # 3. Check for Black Mask (Low brightness, low texture)
+                elif avg_color < 70 and std_color < 40:
+                    preds.append({'label': "Mask", 'prob': 0.94})
+                
+                # 4. Check for Kerchief/Fabric Pattern (High texture/variation)
+                elif edge_density > 0.12 or std_color > 55:
+                    preds.append({'label': "Partial Cover", 'prob': 0.75})
+                
+                # 5. Default to No Mask
                 else:
                     preds.append({'label': "No Mask", 'prob': 0.92})
             else:
@@ -210,8 +229,27 @@ def generate_frames():
                 color = (0, 0, 255)
                 no_mask_count += 1
 
-            # Draw bounding box + label
+            # Draw bounding box
             cv2.rectangle(frame, (startX, startY), (endX, endY), color, 2)
+            
+            # --- TOP ALERT MESSAGE ---
+            # Draw an alert badge above the head if not wearing mask properly
+            # Moved slightly lower to avoid status bar overlap
+            y_badge = max(110, startY - 45) 
+            if label != "Mask":
+                alert_text = "VIOLATION!" if label == "No Mask" else "IMPROPER MASK"
+                # Badge background
+                badge_w = 140 if label == "No Mask" else 180
+                cv2.rectangle(frame, (startX, y_badge), (startX + badge_w, y_badge + 25), color, -1)
+                cv2.putText(frame, alert_text, (startX + 5, y_badge + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            else:
+                # Confirm face recognized and safe
+                cv2.rectangle(frame, (startX, y_badge), (startX + 160, y_badge + 25), (0, 150, 0), -1)
+                cv2.putText(frame, "FACE RECOGNIZED", (startX + 5, y_badge + 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+            # Main Label (Percentage)
             cv2.putText(frame, display_label, (startX, startY - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
